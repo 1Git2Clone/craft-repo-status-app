@@ -136,14 +136,23 @@ function cell(entry, col) {
 
 // ───────────────────────────── rendering ─────────────────────────────
 
+/** The group row, built once: rebuilding it would destroy the window
+ * dropdown, closing it mid-choice whenever a poll or the clock re-renders. */
+let groupRow = null;
+
 function renderHead() {
-  const groups = el('tr', { class: 'groups' });
-  let prev = null;
-  for (const c of COLUMNS) {
-    if (c.group === prev) { groups.lastChild.colSpan += 1; continue; }
-    prev = c.group;
-    groups.append(el('th', { class: c.group ? 'group-start' : '' }, c.group === RECENT ? windowPicker() : c.group));
+  if (!groupRow) {
+    groupRow = el('tr', { class: 'groups' });
+    let prev = null;
+    for (const c of COLUMNS) {
+      if (c.group === prev) { groupRow.lastChild.colSpan += 1; continue; }
+      prev = c.group;
+      groupRow.append(el('th', { class: c.group ? 'group-start' : '' }, c.group === RECENT ? windowPicker() : c.group));
+    }
+    $('thead').replaceChildren(groupRow);
   }
+  const picker = groupRow.querySelector('.window-picker');
+  if (picker.value !== state.window) picker.value = state.window;
   const cols = el('tr', { class: 'cols' });
   COLUMNS.forEach((c, i) => {
     const sorted = state.sort.key === c.key;
@@ -160,7 +169,8 @@ function renderHead() {
       },
     }, c.label));
   });
-  $('thead').replaceChildren(groups, cols);
+  groupRow.nextSibling?.remove();
+  $('thead').append(cols);
 }
 
 /** The dropdown that heads the recent-activity columns. */
@@ -171,7 +181,6 @@ function windowPicker() {
     title: 'Time window for the activity columns',
     onchange: (e) => { state.window = e.target.value; save('window', state.window); render(); },
   }, WINDOWS.map((w) => el('option', { value: w.id }, w.label)));
-  sel.value = state.window;
   return sel;
 }
 
