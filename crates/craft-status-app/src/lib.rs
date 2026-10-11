@@ -25,9 +25,10 @@ const TRAY: &str = "main";
 const EV_SNAPSHOT: &str = "craft:snapshot";
 const EV_FOCUS: &str = "craft:focus";
 const EV_META: &str = "craft:meta";
-/// Repositories fetched concurrently. Small on purpose: GitHub's secondary
-/// rate limits punish bursts, and a poll has minutes to finish.
-const WORKERS: usize = 2;
+/// Repositories fetched concurrently. One: GitHub's secondary rate limits
+/// cap GraphQL server time per minute, so parallel requests only trip them
+/// sooner (see `GRAPHQL_PACING` in craft-github); a poll has minutes to finish.
+const WORKERS: usize = 1;
 /// How often the poll thread wakes to check the clock, the config file and
 /// the tray tooltip. Wall-clock based, so a sleeping laptop polls on wake.
 const TICK: Duration = Duration::from_secs(15);

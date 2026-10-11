@@ -28,6 +28,11 @@ use serde_json::{json, Value};
 const API: &str = "https://api.github.com";
 /// How many ranked issues each repo keeps for the Urgent view.
 const KEEP_URGENT: usize = 20;
+/// After each GraphQL request, wait this many times as long as it took.
+/// GitHub allows 60 s of GraphQL server time per minute; back-to-back heavy
+/// queries exceed that within a minute (a secondary rate limit), so requests
+/// from one client keep to about half the wall clock.
+const GRAPHQL_PACING: f64 = 1.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -153,13 +158,15 @@ impl GitHub {
     }
 
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let resp = self
+        let started = std::time::Instant::now();
+        let sent = self
             .http
             .post(format!("{API}/graphql"))
             .headers(self.headers())
             .json(&json!({ "query": query, "variables": variables }))
-            .send()?;
-        let v: Value = Self::check(resp)?.json()?;
+            .send();
+        std::thread::sleep(started.elapsed().mul_f64(GRAPHQL_PACING));
+        let v: Value = Self::check(sent?)?.json()?;
         if let Some(errs) = v["errors"].as_array().filter(|e| !e.is_empty()) {
             let msg = errs
                 .iter()

@@ -86,7 +86,9 @@ scored.
 
 ## Polling and cache
 
-- The app polls every `poll_minutes` (default 5), two repos at a time. Each
+- The app polls every `poll_minutes` (default 5), one repo at a time, pausing
+  after each GraphQL request as long as it took: GitHub allows only 60 s of
+  GraphQL server time per minute, and back-to-back queries exceed it. Each
   repo costs about six GraphQL requests and one REST request: roughly 100 of
   the 5,000 GraphQL points GitHub allows per hour per cycle. It never uses
   search, which GitHub limits far more tightly (to about 30 a minute); PR and
