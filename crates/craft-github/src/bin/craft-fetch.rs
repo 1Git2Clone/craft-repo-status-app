@@ -3,8 +3,8 @@
 //! can load in a plain browser (`ui/dev-snapshot.json`).
 
 use chrono::Utc;
-use craft_core::{Config, LagBasis, RepoEntry, Snapshot, ALL_TIME};
-use craft_github::{resolve_token, Error, GitHub};
+use craft_core::{Cache, Config, LagBasis, RepoEntry, Snapshot, ALL_TIME};
+use craft_github::{resolve_token, Error, GitHub, RawActivity};
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,8 +39,21 @@ fn main() {
     for repo in &repos {
         let mut entry = RepoEntry::new(repo);
         entry.last_attempt_at = Some(now);
-        match gh.fetch_repo(repo, now) {
+        // Shares the app's raw cache, so either warms it for the other.
+        let raw_dir = Cache::default_location()
+            .ok()
+            .map(|c| c.dir().to_path_buf());
+        let mut raw = raw_dir
+            .as_deref()
+            .map(|d| RawActivity::load(d, repo))
+            .unwrap_or_default();
+        match gh.fetch_repo(repo, now, &mut raw) {
             Ok((s, budget)) => {
+                if let Some(dir) = &raw_dir {
+                    if let Err(e) = raw.save(dir, repo) {
+                        eprintln!("{repo}: could not save raw cache: {e}");
+                    }
+                }
                 // The table shows the 4-hour window; the snapshot carries them all.
                 let r4 = s.recent.get("4h").copied().unwrap_or_default();
                 let all = s.recent.get(ALL_TIME).copied().unwrap_or_default();

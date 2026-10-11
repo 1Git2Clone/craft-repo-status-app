@@ -27,6 +27,11 @@ impl Cache {
         &self.path
     }
 
+    /// The directory holding the snapshot, where other cached data lives too.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(&self.path)
+    }
+
     pub fn load(&self) -> Option<Snapshot> {
         let text = std::fs::read_to_string(&self.path).ok()?;
         let mut s: Snapshot = serde_json::from_str(&text).ok()?;

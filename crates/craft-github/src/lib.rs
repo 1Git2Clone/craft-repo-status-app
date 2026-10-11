@@ -9,10 +9,14 @@
 //! issues opened, since a week ago or the latest build, whichever is earlier,
 //! which give each window's people and PR/issue counts. No search API: GitHub
 //! limits searches far more tightly than other queries, even inside GraphQL;
+//! The authors, PRs and issues are kept between polls ([`RawActivity`]), so
+//! after the first poll those queries fetch only what's new;
 //! one (usually) REST call for the contributor list, which GraphQL lacks.
 //! The icon itself is a REST blob fetch, made only when its blob id changes
 //! (see [`GitHub::icon`]). Blocking I/O: callers run this on worker threads.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -23,11 +27,26 @@ use craft_core::{
 };
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, USER_AGENT};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const API: &str = "https://api.github.com";
 /// How many ranked issues each repo keeps for the Urgent view.
 const KEEP_URGENT: usize = 20;
+/// After each GraphQL request, wait this many times as long as it took.
+/// GitHub allows 60 s of GraphQL server time per minute; back-to-back heavy
+/// queries exceed that within a minute (a secondary rate limit), so requests
+/// from one client keep to about half the wall clock.
+const GRAPHQL_PACING: f64 = 1.0;
+/// How far before the previous fetch an incremental one starts, so nothing
+/// that landed while it ran slips between the two.
+const OVERLAP_MINUTES: i64 = 10;
+/// How often [`RawActivity`] is refetched from scratch, dropping deleted
+/// issues and picking up commits that reached `main` with older dates.
+const FULL_REFRESH_HOURS: i64 = 6;
+/// Pages of 100 each history walk may take; a busier stretch undercounts its
+/// oldest windows (photocraft opens ~2000 PRs a week).
+const MAX_PAGES: usize = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -153,13 +172,15 @@ impl GitHub {
     }
 
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let resp = self
+        let started = std::time::Instant::now();
+        let sent = self
             .http
             .post(format!("{API}/graphql"))
             .headers(self.headers())
             .json(&json!({ "query": query, "variables": variables }))
-            .send()?;
-        let v: Value = Self::check(resp)?.json()?;
+            .send();
+        std::thread::sleep(started.elapsed().mul_f64(GRAPHQL_PACING));
+        let v: Value = Self::check(sent?)?.json()?;
         if let Some(errs) = v["errors"].as_array().filter(|e| !e.is_empty()) {
             let msg = errs
                 .iter()
@@ -179,8 +200,15 @@ impl GitHub {
         Ok(v["data"].clone())
     }
 
-    /// Everything the UI shows for `owner/name`, measured at `now`.
-    pub fn fetch_repo(&self, repo: &str, now: DateTime<Utc>) -> Result<(RepoStats, Budget)> {
+    /// Everything the UI shows for `owner/name`, measured at `now`. `raw` is
+    /// the activity kept from the previous fetch; it's brought up to date
+    /// only when the whole fetch succeeds.
+    pub fn fetch_repo(
+        &self,
+        repo: &str,
+        now: DateTime<Utc>,
+        raw: &mut RawActivity,
+    ) -> Result<(RepoStats, Budget)> {
         let (owner, name) = repo
             .split_once('/')
             .ok_or_else(|| Error::GraphQl(format!("bad repo {repo:?}")))?;
@@ -192,9 +220,23 @@ impl GitHub {
         )?;
         let since_build = self.since_build(owner, name, &main, &releases)?;
         let since = activity_start(now, release_at);
-        let authors = self.authors(owner, name, since)?;
-        let events = self.events(owner, name, since)?;
+        let mut fresh = raw.clone();
+        let (from, full) = fresh.fetch_from(since, now);
+        if full {
+            fresh = RawActivity {
+                full_at: Some(now),
+                ..Default::default()
+            };
+        }
+        fresh.commits.extend(self.authors(owner, name, from)?);
+        self.events(owner, name, from, &mut fresh)?;
+        fresh.covers_from = Some(since);
+        fresh.fetched_at = Some(now);
+        fresh.prune(since);
+        let authors: Vec<CommitAuthor> = fresh.commits.values().cloned().collect();
+        let events = fresh.events();
         let contributors = self.contributors(repo)?;
+        *raw = fresh;
         let budget = Budget {
             graphql_remaining: main["rateLimit"]["remaining"].as_u64(),
         };
@@ -226,13 +268,17 @@ impl GitHub {
         Ok(format!("data:image/png;base64,{b64}"))
     }
 
-    /// `(committed, author)` for each commit on `main` since `since`.
-    fn authors(&self, owner: &str, name: &str, since: DateTime<Utc>) -> Result<Vec<CommitAuthor>> {
+    /// `(oid, (committed, author))` for each commit on `main` since `since`.
+    fn authors(
+        &self,
+        owner: &str,
+        name: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, CommitAuthor)>> {
         let since = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut out = Vec::new();
         let mut after: Option<String> = None;
-        // 10 pages × 100 commits; a busier stretch undercounts its oldest people.
-        for _ in 0..10 {
+        for _ in 0..MAX_PAGES {
             let v = self.graphql(
                 AUTHORS_QUERY,
                 json!({ "owner": owner, "name": name, "since": since, "after": after }),
@@ -248,15 +294,19 @@ impl GitHub {
     }
 
     /// When each PR was opened or merged, and each issue opened, since
-    /// `since`: the three lists walked newest first, each until it passes
-    /// `since`. Merged PRs are walked by last update, which merging bumps.
-    fn events(&self, owner: &str, name: &str, since: DateTime<Utc>) -> Result<Events> {
-        let mut ev = Events::default();
+    /// `since`, added to `raw` by number: the three lists walked newest
+    /// first, each until it passes `since`. Merged PRs are walked by last
+    /// update, which merging bumps.
+    fn events(
+        &self,
+        owner: &str,
+        name: &str,
+        since: DateTime<Utc>,
+        raw: &mut RawActivity,
+    ) -> Result<()> {
         let mut more = [true; 3];
         let mut after: [Option<String>; 3] = Default::default();
-        // 30 pages × 100 of each (photocraft opens ~2000 PRs a week); a busier
-        // stretch undercounts its oldest windows.
-        for _ in 0..30 {
+        for _ in 0..MAX_PAGES {
             if !more.iter().any(|m| *m) {
                 break;
             }
@@ -269,9 +319,9 @@ impl GitHub {
                 }),
             )?;
             let lists = [
-                ("opened", "createdAt", "createdAt", &mut ev.prs_opened),
-                ("merged", "updatedAt", "mergedAt", &mut ev.prs_merged),
-                ("issues", "createdAt", "createdAt", &mut ev.issues_opened),
+                ("opened", "createdAt", "createdAt", &mut raw.prs_opened),
+                ("merged", "updatedAt", "mergedAt", &mut raw.prs_merged),
+                ("issues", "createdAt", "createdAt", &mut raw.issues_opened),
             ];
             for (i, (alias, order, field, out)) in lists.into_iter().enumerate() {
                 if !more[i] {
@@ -284,7 +334,7 @@ impl GitHub {
                 after[i] = conn["pageInfo"]["endCursor"].as_str().map(str::to_string);
             }
         }
-        Ok(ev)
+        Ok(())
     }
 
     /// Commits on `main` since the latest build; `None` without a build, a
@@ -382,7 +432,8 @@ pub fn parse_contributors(body: &Value) -> Vec<String> {
 /// One commit's date and its author, keyed by GitHub login, else email, else name.
 pub type CommitAuthor = (DateTime<Utc>, String);
 
-pub fn parse_authors(conn: &Value) -> Vec<CommitAuthor> {
+/// `(oid, (committed, author))` per commit node.
+pub fn parse_authors(conn: &Value) -> Vec<(String, CommitAuthor)> {
     conn["nodes"]
         .as_array()
         .map(|nodes| {
@@ -400,7 +451,11 @@ pub fn parse_authors(conn: &Value) -> Vec<CommitAuthor> {
                                 .map(str::to_lowercase)
                         })
                         .or_else(|| a["name"].as_str().map(str::to_string))?;
-                    Some((time(&c["committedDate"])?, who))
+                    let at = time(&c["committedDate"])?;
+                    let oid = c["oid"]
+                        .as_str()
+                        .map_or_else(|| format!("{at} {who}"), str::to_string);
+                    Some((oid, (at, who)))
                 })
                 .collect()
         })
@@ -523,27 +578,106 @@ pub struct Events {
     pub issues_opened: Vec<DateTime<Utc>>,
 }
 
+/// Activity kept between polls, in the cache directory, so each poll asks
+/// GitHub only for what's new. Keyed by commit oid and PR/issue number, so
+/// overlapping fetches merge instead of double counting.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawActivity {
+    /// Everything from here to `fetched_at` is held.
+    pub covers_from: Option<DateTime<Utc>>,
+    /// When the last fetch started.
+    pub fetched_at: Option<DateTime<Utc>>,
+    /// When the last fetch from scratch started.
+    pub full_at: Option<DateTime<Utc>>,
+    pub commits: BTreeMap<String, CommitAuthor>,
+    pub prs_opened: BTreeMap<u64, DateTime<Utc>>,
+    pub prs_merged: BTreeMap<u64, DateTime<Utc>>,
+    pub issues_opened: BTreeMap<u64, DateTime<Utc>>,
+}
+
+impl RawActivity {
+    fn path(dir: &Path, repo: &str) -> PathBuf {
+        dir.join("raw")
+            .join(format!("{}.json", repo.replace('/', "@")))
+    }
+
+    /// The activity kept for `repo` under `dir`; empty if missing or corrupt.
+    pub fn load(dir: &Path, repo: &str) -> RawActivity {
+        std::fs::read_to_string(Self::path(dir, repo))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, dir: &Path, repo: &str) -> craft_core::Result<()> {
+        craft_core::atomic_write(&Self::path(dir, repo), &serde_json::to_string(self)?)
+    }
+
+    /// Where the next fetch for activity since `since` starts, and whether it
+    /// is from scratch: when nothing reaches back to `since`, or the last
+    /// fetch from scratch is [`FULL_REFRESH_HOURS`] old.
+    pub fn fetch_from(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> (DateTime<Utc>, bool) {
+        let warm = self.covers_from.is_some_and(|c| c <= since)
+            && self
+                .full_at
+                .is_some_and(|f| now - f < chrono::Duration::hours(FULL_REFRESH_HOURS));
+        match self.fetched_at {
+            Some(last) if warm => (
+                (last - chrono::Duration::minutes(OVERLAP_MINUTES)).max(since),
+                false,
+            ),
+            _ => (since, true),
+        }
+    }
+
+    /// Drop everything before `since`.
+    pub fn prune(&mut self, since: DateTime<Utc>) {
+        self.commits.retain(|_, (at, _)| *at >= since);
+        for m in [
+            &mut self.prs_opened,
+            &mut self.prs_merged,
+            &mut self.issues_opened,
+        ] {
+            m.retain(|_, at| *at >= since);
+        }
+    }
+
+    pub fn events(&self) -> Events {
+        Events {
+            prs_opened: self.prs_opened.values().copied().collect(),
+            prs_merged: self.prs_merged.values().copied().collect(),
+            issues_opened: self.issues_opened.values().copied().collect(),
+        }
+    }
+}
+
 /// The start of the longest window, or of the latest build if that's earlier.
 fn activity_start(now: DateTime<Utc>, release_at: Option<DateTime<Utc>>) -> DateTime<Utc> {
     let longest = WINDOWS.iter().map(|(_, m)| *m).max().unwrap_or(0);
     (now - chrono::Duration::minutes(longest)).min(release_at.unwrap_or(now))
 }
 
-/// The `field` times at or after `since` from one page of `conn`, whose
-/// nodes are sorted newest first by `order`; `true` once the page has reached
-/// nodes older than `since`, so later pages can't hold any.
+/// `(number, field time)` for the nodes of one page of `conn` whose `field`
+/// is at or after `since`; the nodes are sorted newest first by `order`.
+/// `true` once the page has reached nodes older than `since`, so later pages
+/// can't hold any.
 pub fn parse_events(
     conn: &Value,
     order: &str,
     field: &str,
     since: DateTime<Utc>,
-) -> (Vec<DateTime<Utc>>, bool) {
+) -> (Vec<(u64, DateTime<Utc>)>, bool) {
     let mut out = Vec::new();
     for n in conn["nodes"].as_array().into_iter().flatten() {
         if time(&n[order]).is_some_and(|t| t < since) {
             return (out, true);
         }
-        out.extend(time(&n[field]).filter(|t| *t >= since));
+        if let (Some(num), Some(t)) = (n["number"].as_u64(), time(&n[field])) {
+            if t >= since {
+                out.push((num, t));
+            }
+        }
     }
     (out, false)
 }
@@ -745,7 +879,7 @@ query($owner: String!, $name: String!, $since: GitTimestamp!, $after: String) {
         ... on Commit {
           history(since: $since, first: 100, after: $after) {
             pageInfo { hasNextPage endCursor }
-            nodes { committedDate author { email name user { login } } }
+            nodes { oid committedDate author { email name user { login } } }
           }
         }
       }
@@ -762,15 +896,15 @@ query($owner: String!, $name: String!, $opened: Boolean!, $merged: Boolean!, $is
   repository(owner: $owner, name: $name) {
     opened: pullRequests(first: 100, after: $openedAfter, orderBy: {field: CREATED_AT, direction: DESC}) @include(if: $opened) {
       pageInfo { hasNextPage endCursor }
-      nodes { createdAt }
+      nodes { number createdAt }
     }
     merged: pullRequests(states: MERGED, first: 100, after: $mergedAfter, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $merged) {
       pageInfo { hasNextPage endCursor }
-      nodes { updatedAt mergedAt }
+      nodes { number updatedAt mergedAt }
     }
     issues: issues(first: 100, after: $issuesAfter, orderBy: {field: CREATED_AT, direction: DESC}) @include(if: $issues) {
       pageInfo { hasNextPage endCursor }
-      nodes { createdAt }
+      nodes { number createdAt }
     }
   }
 }
@@ -849,6 +983,7 @@ mod tests {
           {"committedDate": "2026-10-08T02:00:00Z", "author": {"email": "Bo@Y", "name": "Bo", "user": null}},
           {"committedDate": "2026-10-03T00:00:00Z", "author": {"email": "", "name": "Cy", "user": null}}
         ]}));
+        let authors: Vec<CommitAuthor> = authors.into_iter().map(|(_, a)| a).collect();
         assert_eq!(authors[2].1, "bo@y");
         let mut people =
             parse_contributors(&json!([{"login": "ann"}, {"email": "Old@Z", "type": "Anonymous"}]));
@@ -967,29 +1102,69 @@ mod tests {
         let since: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
         let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
         let merged = json!({"nodes": [
-          {"updatedAt": "2026-10-08T00:00:00Z", "mergedAt": "2026-10-07T00:00:00Z"},
+          {"number": 9, "updatedAt": "2026-10-08T00:00:00Z", "mergedAt": "2026-10-07T00:00:00Z"},
           // Updated lately but merged long ago: skipped, and the walk goes on.
-          {"updatedAt": "2026-10-06T00:00:00Z", "mergedAt": "2026-09-01T00:00:00Z"},
-          {"updatedAt": "2026-10-02T00:00:00Z", "mergedAt": "2026-10-01T00:00:00Z"},
-          {"updatedAt": "2026-09-30T00:00:00Z", "mergedAt": "2026-09-30T00:00:00Z"},
-          {"updatedAt": "2026-10-05T00:00:00Z", "mergedAt": "2026-10-05T00:00:00Z"}
+          {"number": 8, "updatedAt": "2026-10-06T00:00:00Z", "mergedAt": "2026-09-01T00:00:00Z"},
+          {"number": 7, "updatedAt": "2026-10-02T00:00:00Z", "mergedAt": "2026-10-01T00:00:00Z"},
+          {"number": 6, "updatedAt": "2026-09-30T00:00:00Z", "mergedAt": "2026-09-30T00:00:00Z"},
+          {"number": 5, "updatedAt": "2026-10-05T00:00:00Z", "mergedAt": "2026-10-05T00:00:00Z"}
         ]});
         assert_eq!(
             parse_events(&merged, "updatedAt", "mergedAt", since),
             (
-                vec![t("2026-10-07T00:00:00Z"), t("2026-10-01T00:00:00Z")],
+                vec![
+                    (9, t("2026-10-07T00:00:00Z")),
+                    (7, t("2026-10-01T00:00:00Z"))
+                ],
                 true
             )
         );
-        let opened = json!({"nodes": [{"createdAt": "2026-10-03T00:00:00Z"}]});
+        let opened = json!({"nodes": [{"number": 3, "createdAt": "2026-10-03T00:00:00Z"}]});
         assert_eq!(
             parse_events(&opened, "createdAt", "createdAt", since),
-            (vec![t("2026-10-03T00:00:00Z")], false)
+            (vec![(3, t("2026-10-03T00:00:00Z"))], false)
         );
         assert_eq!(
             parse_events(&Value::Null, "createdAt", "createdAt", since),
             (vec![], false)
         );
+    }
+
+    #[test]
+    fn raw_activity_fetches_only_whats_new() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let week_ago = t("2026-10-01T04:00:00Z");
+        let now = t("2026-10-08T04:00:00Z");
+        let cold = RawActivity::default();
+        assert_eq!(cold.fetch_from(week_ago, now), (week_ago, true));
+        let mut raw = RawActivity {
+            covers_from: Some(week_ago),
+            fetched_at: Some(t("2026-10-08T03:55:00Z")),
+            full_at: Some(t("2026-10-08T01:00:00Z")),
+            ..Default::default()
+        };
+        // Warm: from just before the previous fetch.
+        assert_eq!(
+            raw.fetch_from(week_ago, now),
+            (t("2026-10-08T03:45:00Z"), false)
+        );
+        // A window reaching further back than what's held starts over.
+        assert!(raw.fetch_from(t("2026-09-20T00:00:00Z"), now).1);
+        // So does an old full fetch.
+        assert!(raw.fetch_from(week_ago, t("2026-10-08T08:00:00Z")).1);
+        raw.prs_opened.insert(1, t("2026-09-30T00:00:00Z"));
+        raw.prs_opened.insert(2, t("2026-10-02T00:00:00Z"));
+        raw.prs_opened.insert(2, t("2026-10-02T00:00:00Z"));
+        raw.commits
+            .insert("a".into(), (t("2026-09-30T00:00:00Z"), "ann".into()));
+        raw.prune(week_ago);
+        assert_eq!(raw.events().prs_opened, vec![t("2026-10-02T00:00:00Z")]);
+        assert!(raw.commits.is_empty());
+        let dir = std::env::temp_dir().join(format!("craft-raw-{}", std::process::id()));
+        raw.save(&dir, "o/r").unwrap();
+        assert_eq!(RawActivity::load(&dir, "o/r"), raw);
+        assert_eq!(RawActivity::load(&dir, "o/missing"), RawActivity::default());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
