@@ -25,9 +25,9 @@ const TRAY: &str = "main";
 const EV_SNAPSHOT: &str = "craft:snapshot";
 const EV_FOCUS: &str = "craft:focus";
 const EV_META: &str = "craft:meta";
-/// Repositories fetched concurrently. Small on purpose: GitHub frowns on
-/// bursts (secondary rate limits) and 12 repos finish in well under 15 s.
-const WORKERS: usize = 4;
+/// Repositories fetched concurrently. Small on purpose: GitHub's secondary
+/// rate limits punish bursts, and a poll has minutes to finish.
+const WORKERS: usize = 2;
 /// How often the poll thread wakes to check the clock, the config file and
 /// the tray tooltip. Wall-clock based, so a sleeping laptop polls on wake.
 const TICK: Duration = Duration::from_secs(15);
@@ -247,9 +247,14 @@ fn run_cycle(app: &AppHandle) -> i64 {
 
     let queue = Mutex::new(cfg.repos.iter().rev().cloned().collect::<Vec<_>>());
     let failures = Mutex::new(Vec::<GhError>::new());
+    // Once GitHub rate-limits one repo, more requests only prolong it.
+    let halted = AtomicBool::new(false);
     std::thread::scope(|scope| {
         for _ in 0..WORKERS.min(cfg.repos.len()) {
             scope.spawn(|| loop {
+                if halted.load(Ordering::Relaxed) {
+                    break;
+                }
                 let Some(repo) = queue.lock().unwrap().pop() else {
                     break;
                 };
@@ -309,6 +314,9 @@ fn run_cycle(app: &AppHandle) -> i64 {
                             entry.inaccessible = true;
                         }
                         Err(e) => {
+                            if matches!(e, GhError::RateLimited(_)) {
+                                halted.store(true, Ordering::Relaxed);
+                            }
                             entry.error = Some(e.to_string());
                             failures.lock().unwrap().push(e);
                         }

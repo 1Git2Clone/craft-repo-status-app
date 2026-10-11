@@ -86,14 +86,17 @@ scored.
 
 ## Polling and cache
 
-- The app polls every `poll_minutes` (default 5), four repos at a time. Each
-  repo costs about five GraphQL requests and one REST request: roughly 65 of
-  the 5,000 GraphQL points GitHub allows per hour per cycle.
+- The app polls every `poll_minutes` (default 5), two repos at a time. Each
+  repo costs about six GraphQL requests and one REST request: roughly 100 of
+  the 5,000 GraphQL points GitHub allows per hour per cycle. It never uses
+  search, which GitHub limits far more tightly (to about 30 a minute); PR and
+  issue counts per window come from walking the recent PRs and issues.
 - Each repo's icon is `assets/app-icon/hicolor/64x64/apps/*.png` on its default
   branch. It is downloaded once and again only when the file changes; it's
   kept in the cache. Repos without one (libraries) get a lettered tile.
 - If fewer than 150 points remain, polling slows to every 30 minutes. If
-  GitHub rate-limits the app, it waits three intervals. If every repo fails
+  GitHub rate-limits the app, it stops that poll at once and waits three
+  intervals. If every repo fails
   (offline, or just woke from sleep), it retries after one minute.
 - Timing follows the wall clock, so a laptop that wakes from sleep polls
   within about 15 s.

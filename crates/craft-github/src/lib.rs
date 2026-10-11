@@ -1,12 +1,14 @@
 //! Fetches one repository's [`RepoStats`] from GitHub.
 //!
 //! Per repo: one (usually) GraphQL query for releases + asset download
-//! counts; one GraphQL query for counts, dates, every recent-activity window
-//! ([`WINDOWS`], plus [`SINCE_RELEASE`], which needs the releases), the app
-//! icon's blob id and the open issues to rank; one GraphQL query comparing the
-//! latest build's tag with `main`; one or more GraphQL queries for the commit
-//! authors since a week ago or the latest build, whichever is earlier, which
-//! give each window's people;
+//! counts; one GraphQL query for counts, dates, each recent-activity window's
+//! commits ([`WINDOWS`], plus [`SINCE_RELEASE`], which needs the releases),
+//! the app icon's blob id and the open issues to rank; one GraphQL query
+//! comparing the latest build's tag with `main`; one or more GraphQL queries
+//! for the commit authors, and one or more for the PRs opened and merged and
+//! issues opened, since a week ago or the latest build, whichever is earlier,
+//! which give each window's people and PR/issue counts. No search API: GitHub
+//! limits searches far more tightly than other queries, even inside GraphQL;
 //! one (usually) REST call for the contributor list, which GraphQL lacks.
 //! The icon itself is a REST blob fetch, made only when its blob id changes
 //! (see [`GitHub::icon`]). Blocking I/O: callers run this on worker threads.
@@ -125,12 +127,16 @@ impl GitHub {
             .get("x-ratelimit-remaining")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let reset = resp
-            .headers()
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<i64>().ok())
-            .and_then(|t| DateTime::from_timestamp(t, 0));
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        // Secondary (burst) limits say when to retry; the hourly one when it resets.
+        let reset = header("retry-after")
+            .map(|secs| Utc::now() + chrono::Duration::seconds(secs))
+            .or_else(|| header("x-ratelimit-reset").and_then(|t| DateTime::from_timestamp(t, 0)));
         let body = resp.text().unwrap_or_default();
         if (status.as_u16() == 403 || status.as_u16() == 429)
             && (remaining.as_deref() == Some("0") || body.contains("rate limit"))
@@ -181,16 +187,26 @@ impl GitHub {
         let releases = self.releases(owner, name)?;
         let release_at = summarize_releases(&releases).latest_at;
         let main = self.graphql(
-            &main_query(repo, now, release_at),
+            &main_query(now, release_at),
             json!({ "owner": owner, "name": name }),
         )?;
         let since_build = self.since_build(owner, name, &main, &releases)?;
-        let authors = self.authors(owner, name, now, release_at)?;
+        let since = activity_start(now, release_at);
+        let authors = self.authors(owner, name, since)?;
+        let events = self.events(owner, name, since)?;
         let contributors = self.contributors(repo)?;
         let budget = Budget {
             graphql_remaining: main["rateLimit"]["remaining"].as_u64(),
         };
-        let stats = build_stats(&main, &releases, since_build, &contributors, &authors, now);
+        let stats = build_stats(
+            &main,
+            &releases,
+            since_build,
+            &contributors,
+            &authors,
+            &events,
+            now,
+        );
         Ok((stats, budget))
     }
 
@@ -210,19 +226,9 @@ impl GitHub {
         Ok(format!("data:image/png;base64,{b64}"))
     }
 
-    /// `(committed, author)` for each commit on `main` in the longest window,
-    /// or since the latest build if that's longer.
-    fn authors(
-        &self,
-        owner: &str,
-        name: &str,
-        now: DateTime<Utc>,
-        release_at: Option<DateTime<Utc>>,
-    ) -> Result<Vec<CommitAuthor>> {
-        let longest = WINDOWS.iter().map(|(_, m)| *m).max().unwrap_or(0);
-        let since = (now - chrono::Duration::minutes(longest))
-            .min(release_at.unwrap_or(now))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    /// `(committed, author)` for each commit on `main` since `since`.
+    fn authors(&self, owner: &str, name: &str, since: DateTime<Utc>) -> Result<Vec<CommitAuthor>> {
+        let since = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut out = Vec::new();
         let mut after: Option<String> = None;
         // 10 pages × 100 commits; a busier stretch undercounts its oldest people.
@@ -239,6 +245,46 @@ impl GitHub {
             after = conn["pageInfo"]["endCursor"].as_str().map(str::to_string);
         }
         Ok(out)
+    }
+
+    /// When each PR was opened or merged, and each issue opened, since
+    /// `since`: the three lists walked newest first, each until it passes
+    /// `since`. Merged PRs are walked by last update, which merging bumps.
+    fn events(&self, owner: &str, name: &str, since: DateTime<Utc>) -> Result<Events> {
+        let mut ev = Events::default();
+        let mut more = [true; 3];
+        let mut after: [Option<String>; 3] = Default::default();
+        // 30 pages × 100 of each (photocraft opens ~2000 PRs a week); a busier
+        // stretch undercounts its oldest windows.
+        for _ in 0..30 {
+            if !more.iter().any(|m| *m) {
+                break;
+            }
+            let v = self.graphql(
+                EVENTS_QUERY,
+                json!({
+                    "owner": owner, "name": name,
+                    "opened": more[0], "merged": more[1], "issues": more[2],
+                    "openedAfter": after[0], "mergedAfter": after[1], "issuesAfter": after[2],
+                }),
+            )?;
+            let lists = [
+                ("opened", "createdAt", "createdAt", &mut ev.prs_opened),
+                ("merged", "updatedAt", "mergedAt", &mut ev.prs_merged),
+                ("issues", "createdAt", "createdAt", &mut ev.issues_opened),
+            ];
+            for (i, (alias, order, field, out)) in lists.into_iter().enumerate() {
+                if !more[i] {
+                    continue;
+                }
+                let conn = &v["repository"][alias];
+                let (times, done) = parse_events(conn, order, field, since);
+                out.extend(times);
+                more[i] = !done && conn["pageInfo"]["hasNextPage"].as_bool() == Some(true);
+                after[i] = conn["pageInfo"]["endCursor"].as_str().map(str::to_string);
+            }
+        }
+        Ok(ev)
     }
 
     /// Commits on `main` since the latest build; `None` without a build, a
@@ -468,11 +514,42 @@ fn parse_issues(conn: &Value) -> Vec<IssueInput> {
         .unwrap_or_default()
 }
 
-fn search_count(main: &Value, alias: &str) -> u64 {
-    main[alias]["issueCount"].as_u64().unwrap_or(0)
+/// When PRs were opened and merged and issues opened, since
+/// [`activity_start`]; [`recent_activity`] buckets them into windows.
+#[derive(Debug, Clone, Default)]
+pub struct Events {
+    pub prs_opened: Vec<DateTime<Utc>>,
+    pub prs_merged: Vec<DateTime<Utc>>,
+    pub issues_opened: Vec<DateTime<Utc>>,
 }
 
-/// Reads the per-window aliases [`main_query`] asked for. A repo with no
+/// The start of the longest window, or of the latest build if that's earlier.
+fn activity_start(now: DateTime<Utc>, release_at: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let longest = WINDOWS.iter().map(|(_, m)| *m).max().unwrap_or(0);
+    (now - chrono::Duration::minutes(longest)).min(release_at.unwrap_or(now))
+}
+
+/// The `field` times at or after `since` from one page of `conn`, whose
+/// nodes are sorted newest first by `order`; `true` once the page has reached
+/// nodes older than `since`, so later pages can't hold any.
+pub fn parse_events(
+    conn: &Value,
+    order: &str,
+    field: &str,
+    since: DateTime<Utc>,
+) -> (Vec<DateTime<Utc>>, bool) {
+    let mut out = Vec::new();
+    for n in conn["nodes"].as_array().into_iter().flatten() {
+        if time(&n[order]).is_some_and(|t| t < since) {
+            return (out, true);
+        }
+        out.extend(time(&n[field]).filter(|t| *t >= since));
+    }
+    (out, false)
+}
+
+/// Reads the per-window commit counts [`main_query`] asked for and buckets
+/// `events` by window. A repo with no
 /// default branch still gets every window (with zero commits).
 /// The all-time totals come along as the [`ALL_TIME`] window; its people are
 /// GitHub's contributors plus any newer `authors`, the others' the distinct
@@ -483,6 +560,7 @@ fn recent_activity(
     main: &Value,
     contributors: &[String],
     authors: &[CommitAuthor],
+    events: &Events,
     release_at: Option<DateTime<Utc>>,
     unreleased: Option<u64>,
     now: DateTime<Utc>,
@@ -503,11 +581,13 @@ fn recent_activity(
             .collect::<std::collections::HashSet<_>>()
             .len() as u64,
     };
+    let after =
+        |times: &[DateTime<Utc>], since| times.iter().filter(|t| **t >= since).count() as u64;
     let window = |key: &str, since: DateTime<Utc>| Activity {
         commits: count(&head[format!("c{key}")]),
-        prs_opened: search_count(main, &format!("p{key}")),
-        prs_merged: search_count(main, &format!("m{key}")),
-        issues_opened: search_count(main, &format!("i{key}")),
+        prs_opened: after(&events.prs_opened, since),
+        prs_merged: after(&events.prs_merged, since),
+        issues_opened: after(&events.issues_opened, since),
         people: authors
             .iter()
             .filter(|(at, _)| *at >= since)
@@ -545,30 +625,16 @@ fn windows(
         .chain(release_at.map(|at| (SINCE_RELEASE, "r".to_string(), at)))
 }
 
-/// [`MAIN_QUERY`] with one commit-history count and three searches per
-/// window, aliased by window index (`c0`, `p0`, `m0`, `i0`…), plus the
-/// [`SINCE_RELEASE`] window (`cr`, `pr`…) when there is a build published at
-/// `release_at`. GitHub charges the whole query one rate-limit point however
-/// many windows it holds.
-pub fn main_query(repo: &str, now: DateTime<Utc>, release_at: Option<DateTime<Utc>>) -> String {
+/// [`MAIN_QUERY`] with one commit-history count per window, aliased by
+/// window index (`c0`, `c1`…), plus the [`SINCE_RELEASE`] window (`cr`) when
+/// there is a build published at `release_at`.
+pub fn main_query(now: DateTime<Utc>, release_at: Option<DateTime<Utc>>) -> String {
     let mut history = String::new();
-    let mut searches = String::new();
     for (_, i, since) in windows(now, release_at) {
         let since = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         history += &format!("c{i}: history(since: \"{since}\") {{ totalCount }}\n");
-        for (alias, filter) in [
-            ("p", format!("is:pr created:>={since}")),
-            ("m", format!("is:pr merged:>={since}")),
-            ("i", format!("is:issue created:>={since}")),
-        ] {
-            let q = Value::from(format!("repo:{repo} {filter}"));
-            searches +=
-                &format!("  {alias}{i}: search(query: {q}, type: ISSUE) {{ issueCount }}\n");
-        }
     }
-    MAIN_QUERY
-        .replace("{HISTORY}", &history)
-        .replace("{SEARCHES}", &searches)
+    MAIN_QUERY.replace("{HISTORY}", &history)
 }
 
 /// Pure: turn the GraphQL payloads into the model (unit-tested below).
@@ -578,6 +644,7 @@ pub fn build_stats(
     since_build: Option<BuildLag>,
     contributors: &[String],
     authors: &[CommitAuthor],
+    events: &Events,
     now: DateTime<Utc>,
 ) -> RepoStats {
     let r = &main["repository"];
@@ -598,6 +665,7 @@ pub fn build_stats(
             main,
             contributors,
             authors,
+            events,
             rel.latest_at,
             since_build.as_ref().map(|l| l.commits),
             now,
@@ -644,7 +712,7 @@ query($owner: String!, $name: String!) {
       }
     }
   }
-{SEARCHES}  rateLimit { remaining resetAt }
+  rateLimit { remaining resetAt }
 }
 fragment I on Issue {
   number title url createdAt updatedAt authorAssociation
@@ -681,6 +749,28 @@ query($owner: String!, $name: String!, $since: GitTimestamp!, $after: String) {
           }
         }
       }
+    }
+  }
+}
+"#;
+
+/// One page each of PRs by creation, merged PRs by last update and issues by
+/// creation, newest first; `@include` drops the lists already walked far enough.
+const EVENTS_QUERY: &str = r#"
+query($owner: String!, $name: String!, $opened: Boolean!, $merged: Boolean!, $issues: Boolean!,
+      $openedAfter: String, $mergedAfter: String, $issuesAfter: String) {
+  repository(owner: $owner, name: $name) {
+    opened: pullRequests(first: 100, after: $openedAfter, orderBy: {field: CREATED_AT, direction: DESC}) @include(if: $opened) {
+      pageInfo { hasNextPage endCursor }
+      nodes { createdAt }
+    }
+    merged: pullRequests(states: MERGED, first: 100, after: $mergedAfter, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $merged) {
+      pageInfo { hasNextPage endCursor }
+      nodes { updatedAt mergedAt }
+    }
+    issues: issues(first: 100, after: $issuesAfter, orderBy: {field: CREATED_AT, direction: DESC}) @include(if: $issues) {
+      pageInfo { hasNextPage endCursor }
+      nodes { createdAt }
     }
   }
 }
@@ -727,10 +817,20 @@ mod tests {
             "defaultBranchRef": {"target": {
               "all": {"totalCount": 1234, "nodes": [{"committedDate": "2026-10-08T03:00:00Z"}]},
               "c0": {"totalCount": 1}, "c3": {"totalCount": 9}, "cr": {"totalCount": 99}}}
-          },
-          "p3": {"issueCount": 2}, "m3": {"issueCount": 3}, "i3": {"issueCount": 4}, "m6": {"issueCount": 30},
-          "pr": {"issueCount": 11}, "mr": {"issueCount": 12}, "ir": {"issueCount": 13}
+          }
         });
+        let at = |t: &str, n| vec![t.parse::<DateTime<Utc>>().unwrap(); n];
+        // Inside the last 4 h; inside the last week; before that but after v1.0.0.
+        let events = Events {
+            prs_opened: [at("2026-10-08T01:00:00Z", 2), at("2026-10-02T00:00:00Z", 9)].concat(),
+            prs_merged: [
+                at("2026-10-08T01:00:00Z", 3),
+                at("2026-10-02T00:00:00Z", 27),
+                at("2026-10-01T02:00:00Z", 1),
+            ]
+            .concat(),
+            issues_opened: [at("2026-10-08T01:00:00Z", 4), at("2026-10-01T02:00:00Z", 9)].concat(),
+        };
         let rel = parse_releases(&json!({"nodes": [
           {"tagName": "v1.1.0", "isDraft": true, "isPrerelease": false, "publishedAt": null, "createdAt": "2026-10-08T00:00:00Z",
            "releaseAssets": {"nodes": [{"name": "a.dmg", "downloadCount": 0}]}},
@@ -754,7 +854,15 @@ mod tests {
             parse_contributors(&json!([{"login": "ann"}, {"email": "Old@Z", "type": "Anonymous"}]));
         people.extend((0..10).map(|i| format!("p{i}")));
         assert_eq!(people[1], "old@z");
-        let s = build_stats(&main, &rel, Some(lag.clone()), &people, &authors, now);
+        let s = build_stats(
+            &main,
+            &rel,
+            Some(lag.clone()),
+            &people,
+            &authors,
+            &events,
+            now,
+        );
         assert_eq!((s.open_prs, s.open_issues), (3, 7));
         assert_eq!(s.recent.len(), WINDOWS.len() + 2);
         let a = |id: &str| s.recent[id];
@@ -787,13 +895,13 @@ mod tests {
                 // The Unreleased count, not commits dated after publishing.
                 commits: 5,
                 prs_opened: 11,
-                prs_merged: 12,
+                prs_merged: 31,
                 issues_opened: 13,
                 // Cy committed on the 3rd, after v1.0.0 but before the last week.
                 people: 3,
             }
         );
-        let no_lag = build_stats(&main, &rel, None, &people, &authors, now);
+        let no_lag = build_stats(&main, &rel, None, &people, &authors, &events, now);
         assert_eq!(no_lag.recent[SINCE_RELEASE].commits, 99);
         assert_eq!(s.icon_oid.as_deref(), Some("i1"));
         assert_eq!(s.latest_build.as_deref(), Some("v1.0.0"));
@@ -845,15 +953,42 @@ mod tests {
     #[test]
     fn query_asks_for_every_window() {
         let now: DateTime<Utc> = "2026-10-08T04:00:00Z".parse().unwrap();
-        let q = main_query("o/r", now, None);
+        let q = main_query(now, None);
         assert!(q.contains(r#"c3: history(since: "2026-10-08T00:00:00Z")"#));
-        assert!(q.contains(r#"m6: search(query: "repo:o/r is:pr merged:>=2026-10-01T04:00:00Z""#));
-        assert!(!q.contains("{HISTORY}") && !q.contains("{SEARCHES}"));
+        assert!(q.contains(r#"c6: history(since: "2026-10-01T04:00:00Z")"#));
+        assert!(!q.contains("{HISTORY}") && !q.contains("search("));
         assert!(!q.contains("cr:"), "no build, no since-release window");
-        let q = main_query("o/r", now, Some("2026-09-20T12:00:00Z".parse().unwrap()));
+        let q = main_query(now, Some("2026-09-20T12:00:00Z".parse().unwrap()));
         assert!(q.contains(r#"cr: history(since: "2026-09-20T12:00:00Z")"#));
-        assert!(
-            q.contains(r#"ir: search(query: "repo:o/r is:issue created:>=2026-09-20T12:00:00Z""#)
+    }
+
+    #[test]
+    fn events_stop_at_the_window_start() {
+        let since: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let merged = json!({"nodes": [
+          {"updatedAt": "2026-10-08T00:00:00Z", "mergedAt": "2026-10-07T00:00:00Z"},
+          // Updated lately but merged long ago: skipped, and the walk goes on.
+          {"updatedAt": "2026-10-06T00:00:00Z", "mergedAt": "2026-09-01T00:00:00Z"},
+          {"updatedAt": "2026-10-02T00:00:00Z", "mergedAt": "2026-10-01T00:00:00Z"},
+          {"updatedAt": "2026-09-30T00:00:00Z", "mergedAt": "2026-09-30T00:00:00Z"},
+          {"updatedAt": "2026-10-05T00:00:00Z", "mergedAt": "2026-10-05T00:00:00Z"}
+        ]});
+        assert_eq!(
+            parse_events(&merged, "updatedAt", "mergedAt", since),
+            (
+                vec![t("2026-10-07T00:00:00Z"), t("2026-10-01T00:00:00Z")],
+                true
+            )
+        );
+        let opened = json!({"nodes": [{"createdAt": "2026-10-03T00:00:00Z"}]});
+        assert_eq!(
+            parse_events(&opened, "createdAt", "createdAt", since),
+            (vec![t("2026-10-03T00:00:00Z")], false)
+        );
+        assert_eq!(
+            parse_events(&Value::Null, "createdAt", "createdAt", since),
+            (vec![], false)
         );
     }
 
@@ -865,6 +1000,7 @@ mod tests {
             None,
             &[],
             &[],
+            &Events::default(),
             Utc::now(),
         );
         assert_eq!(s.recent.len(), WINDOWS.len() + 1);
