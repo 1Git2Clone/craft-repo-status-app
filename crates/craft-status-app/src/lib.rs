@@ -2,8 +2,8 @@
 //! on-disk cache, tray icon, global shortcut and window management.
 //!
 //! One background thread owns polling. Every `poll_minutes` (and on demand)
-//! it fetches all repositories with a few worker threads, publishing the
-//! snapshot to the UI after each repository lands and to the cache at the end.
+//! it fetches all repositories one at a time, publishing the snapshot to the
+//! UI and the cache after each repository lands.
 //! Failed repositories keep their previous numbers; staleness is derived from
 //! each repository's `fetched_at`, so old data is always visibly old.
 
@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local, Utc};
 use craft_core::{Cache, Config, Snapshot, WindowState};
-use craft_github::{resolve_token, Error as GhError, GitHub};
+use craft_github::{resolve_token, Error as GhError, GitHub, RawActivity};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -260,7 +260,17 @@ fn run_cycle(app: &AppHandle) -> i64 {
                     break;
                 };
                 let now = Utc::now();
-                let result = gh.fetch_repo(&repo, now);
+                let raw_dir = state.cache.as_ref().map(|c| c.dir().to_path_buf());
+                let mut raw = raw_dir
+                    .as_deref()
+                    .map(|d| RawActivity::load(d, &repo))
+                    .unwrap_or_default();
+                let result = gh.fetch_repo(&repo, now, &mut raw);
+                if let (Ok(_), Some(dir)) = (&result, &raw_dir) {
+                    if let Err(e) = raw.save(dir, &repo) {
+                        eprintln!("{repo}: could not save raw cache: {e}");
+                    }
+                }
                 // The icon only changes with its blob, so most polls skip the download.
                 let held_icon = {
                     let snap = state.snapshot.lock().unwrap();
@@ -320,6 +330,12 @@ fn run_cycle(app: &AppHandle) -> i64 {
                             }
                             entry.error = Some(e.to_string());
                             failures.lock().unwrap().push(e);
+                        }
+                    }
+                    // Kept per repo, so a quit mid-poll loses nothing that landed.
+                    if let Some(cache) = &state.cache {
+                        if let Err(e) = cache.save(&snap) {
+                            eprintln!("could not save cache: {e}");
                         }
                     }
                 }

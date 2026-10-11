@@ -98,15 +98,20 @@ scored.
   kept in the cache. Repos without one (libraries) get a lettered tile.
 - If fewer than 150 points remain, polling slows to every 30 minutes. If
   GitHub rate-limits the app, it stops that poll at once and waits three
-  intervals. If every repo fails
-  (offline, or just woke from sleep), it retries after one minute.
+  intervals. If every repo fails (offline, or just woke from sleep), it
+  retries after one minute.
 - Timing follows the wall clock, so a laptop that wakes from sleep polls
   within about 15 s.
 - `⌘R` or the ⟳ button refreshes immediately.
-- The last snapshot is cached in `~/Library/Caches/craft-status/snapshot.json`.
-  On launch the window shows the cached data at once, marked `STALE` if it's
-  old. If the cache is less than one interval old, the app skips the poll it
-  would otherwise run at launch.
+- Two caches in `~/Library/Caches/craft-status/` survive restarts:
+  - `raw/<owner>@<repo>.json`: each repo's commit authors, PRs and issues
+    from the last week (or since the latest build). Each poll fetches only
+    what's new since the previous one, and refetches from scratch every six
+    hours to drop deleted issues and pick up late-dated commits.
+  - `snapshot.json`: what the window shows, saved after each repo. On launch
+    the window shows it at once, marked `STALE` if it's old. If it is less
+    than one interval old, the app skips the poll it would otherwise run at
+    launch.
 - The GitHub token comes from `github_token` in the config. If that is empty,
   it comes from `$GITHUB_TOKEN` or `$GH_TOKEN`, and if those are unset, from
   `gh auth token`.
