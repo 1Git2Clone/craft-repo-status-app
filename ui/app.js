@@ -181,6 +181,7 @@ function windowPicker() {
     title: 'Time window for the activity columns',
     onchange: (e) => { state.window = e.target.value; save('window', state.window); render(); },
   }, WINDOWS.map((w) => el('option', { value: w.id }, w.label)));
+  return sel;
 }
 
 function groupStart(i) {
