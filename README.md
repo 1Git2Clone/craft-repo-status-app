@@ -15,13 +15,18 @@ cache, and tells you what to fix first. Everything runs locally: no server.
     that prints a table, for debugging.
   - `craft-status-app`: the Tauri 2 shell (poll thread, tray, global
     shortcut, window).
-- **Plain HTML/CSS/ES modules** in `ui/`. There is no bundler and no Node at
-  build time. `ui/model.js` is pure and is tested with `node --test`.
+- **TypeScript, HTML and CSS** in `ui/`, with no framework or bundler. `tsc`
+  compiles `ui/src/` to `ui/build/`, which `index.html` loads; the app's
+  `build.rs` runs it, so building the app needs Node.js 24+ and `npm ci`.
+  `ui/src/model.ts` is pure; it and the UI itself (in happy-dom) are tested
+  with `node --test`. No JavaScript is committed: see `CLAUDE.md`.
 
 ## What it shows
 
 Every column sorts. Click a header; click it again to reverse the order. Repos
-with no data always sort last.
+with no data always sort last. Or drag rows into your own order (say, by
+priority): dropping one clears the sort, and the order is remembered until you
+sort by a column again.
 
 | Group | Columns |
 | --- | --- |
@@ -140,6 +145,7 @@ repo list or the intervals take effect without a restart.
 Prerequisites:
 
 - Rust stable
+- Node.js 24+, then `npm ci` (the UI's TypeScript compiler and test DOM)
 - `cargo install tauri-cli --version "^2"`
 - Xcode CLT on macOS
 - `gh auth login`, or a token in the config
@@ -148,8 +154,8 @@ Prerequisites:
 make install    # release .app → /Applications/Craft Status.app, start at login, launch
 make uninstall  # quit, remove the app and the login item (keeps config + cache)
 make run        # debug binary
-make test       # Rust + UI unit tests
-make check      # clippy + rustfmt
+make test       # Rust + UI tests
+make check      # clippy + rustfmt + tsc type-check
 make snapshot   # fetch once, print a table, write ui/dev-snapshot.json
 make preview    # serve ui/ in a browser against that snapshot (no Tauri needed)
 ```
