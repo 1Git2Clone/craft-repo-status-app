@@ -2,7 +2,7 @@
 // Outside Tauri (plain browser) it loads ./dev-snapshot.json, written by
 // `make snapshot`, so the UI can be iterated on without the app.
 
-import { COLUMNS, RECENT, WINDOWS, windowById, value, sortEntries, defaultDir, freshness, ago, totals, urgentAcross } from './model.js';
+import { COLUMNS, RECENT, WINDOWS, windowById, value, sortEntries, MANUAL, manualOrder, defaultDir, freshness, ago, totals, urgentAcross } from './model.js';
 
 const $ = (id) => document.getElementById(id);
 const TAURI = window.__TAURI__;
@@ -38,6 +38,7 @@ const state = {
   meta: {},
   view: new URLSearchParams(location.search).get('view') ?? load('view', 'repos'),
   sort: load('sort', { key: 'urgency', dir: 'desc' }),
+  order: load('order', []),
   window: windowById(load('window', '')).id,
   urgentRepo: '',
   criticalOnly: load('criticalOnly', false),
@@ -191,14 +192,21 @@ function groupStart(i) {
 function renderTable() {
   renderHead();
   const snap = state.snap;
-  const rows = sortEntries(snap.repos, state.sort.key, state.sort.dir, state.window);
+  const rows = state.sort.key === MANUAL
+    ? manualOrder(snap.repos, state.order)
+    : sortEntries(snap.repos, state.sort.key, state.sort.dir, state.window);
   const now = Date.now();
   $('tbody').replaceChildren(...rows.map((e) => {
     const stale = !e.fetched_at || now - Date.parse(e.fetched_at) > snap.stale_after_secs * 1000;
     return el('tr', {
       class: [stale && 'stale', e.error && 'error'].filter(Boolean).join(' '),
-      title: 'Click for this repo’s most urgent issues',
-      onclick: () => { state.urgentRepo = e.repo; setView('urgent'); },
+      dataset: { repo: e.repo },
+      title: 'Click for this repo’s most urgent issues · drag to reorder',
+      onpointerdown: startRowDrag,
+      onclick: () => {
+        if (justDragged) return;
+        state.urgentRepo = e.repo; setView('urgent');
+      },
     }, COLUMNS.map((c, i) => el('td', { class: groupStart(i) }, cell(e, c))));
   }));
   if (!rows.length) {
@@ -207,6 +215,71 @@ function renderTable() {
   const t = totals(snap.repos, state.window);
   $('tfoot').replaceChildren(el('tr', {}, COLUMNS.map((c, i) =>
     el('td', { class: groupStart(i) }, i === 0 ? `${snap.repos.length} repos` : c.kind === 'num' ? num(Math.round(t[c.key])) : ''))));
+}
+
+// ───────────────────────────── row dragging ─────────────────────────────
+// Pointer events rather than HTML5 drag and drop, which the webview's own
+// file-drop handling can swallow. A press turns into a drag once it moves a
+// few pixels; until then it is an ordinary click. Dropping saves the order on
+// screen and switches the table to it; clicking a column sorts again.
+
+let drag = null;
+let justDragged = false;
+
+function startRowDrag(e) {
+  if (e.button !== 0 || e.target.closest('.link')) return;
+  drag = { row: e.currentTarget, startY: e.clientY, moved: false };
+  window.addEventListener('pointermove', moveRowDrag);
+  window.addEventListener('pointerup', endRowDrag);
+  window.addEventListener('pointercancel', cancelRowDrag);
+}
+
+function moveRowDrag(e) {
+  if (!drag.moved) {
+    if (Math.abs(e.clientY - drag.startY) < 5) return;
+    drag.moved = true;
+    drag.row.classList.add('dragging');
+    document.body.classList.add('reordering');
+    window.getSelection()?.removeAllRanges();
+  }
+  const main = $('repos-view');
+  const box = main.getBoundingClientRect();
+  if (e.clientY < box.top + 50) main.scrollTop -= 12;
+  else if (e.clientY > box.bottom - 40) main.scrollTop += 12;
+
+  const tbody = $('tbody');
+  const next = [...tbody.children].find((r) => {
+    if (r === drag.row) return false;
+    const b = r.getBoundingClientRect();
+    return e.clientY < b.top + b.height / 2;
+  }) ?? null;
+  if (drag.row.nextSibling !== next) tbody.insertBefore(drag.row, next);
+}
+
+function finishRowDrag() {
+  window.removeEventListener('pointermove', moveRowDrag);
+  window.removeEventListener('pointerup', endRowDrag);
+  window.removeEventListener('pointercancel', cancelRowDrag);
+  document.body.classList.remove('reordering');
+  const moved = drag.moved;
+  drag = null;
+  return moved;
+}
+
+function endRowDrag() {
+  if (!finishRowDrag()) return;
+  // The click that follows this pointerup must not open the urgent view.
+  justDragged = true;
+  setTimeout(() => { justDragged = false; });
+  state.order = [...$('tbody').children].map((r) => r.dataset.repo);
+  state.sort = { key: MANUAL };
+  save('order', state.order);
+  save('sort', state.sort);
+  render();
+}
+
+function cancelRowDrag() {
+  if (finishRowDrag()) render();
 }
 
 function renderUrgent() {
@@ -271,7 +344,9 @@ function renderStatus() {
 }
 
 function render() {
-  if (!state.snap) return;
+  // Rebuilding the table mid-drag would drop the row out of the user's hand;
+  // the drop renders anyway.
+  if (!state.snap || drag?.moved) return;
   renderStatus();
   document.querySelectorAll('.view').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.view === state.view)));
   $('repos-view').hidden = state.view !== 'repos';

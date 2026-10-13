@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sortEntries, versionKey, freshness, ago, compact, totals, urgentAcross, defaultDir, value, windowById, WINDOWS } from './model.js';
+import { sortEntries, manualOrder, versionKey, freshness, ago, compact, totals, urgentAcross, defaultDir, value, windowById, WINDOWS } from './model.js';
 
 const entry = (repo, stats, fetched_at = '2026-10-08T12:00:00Z') => ({ repo: `o/${repo}`, stats, fetched_at });
 
@@ -95,4 +95,10 @@ test('recent-activity columns follow the selected window', () => {
   assert.equal(names(sortEntries(e, 'recent_merged', 'desc', 'all')), 'abold');
   assert.equal(value(e[0], 'recent_commits', 'release'), null, 'no release');
   assert.deepEqual(WINDOWS.map((w) => w.id), ['10m', '30m', '1h', '4h', '12h', '1d', '7d', 'release', 'all']);
+});
+
+test('manual order follows the saved list, new repos last in config order', () => {
+  assert.equal(names(manualOrder(rows, ['o/d', 'o/b'])), 'dbac');
+  assert.equal(names(manualOrder(rows, ['o/gone', 'o/c'])), 'cbad');
+  assert.equal(names(manualOrder(rows, [])), 'bacd');
 });
