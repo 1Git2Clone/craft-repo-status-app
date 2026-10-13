@@ -112,6 +112,16 @@ export function sortEntries(entries, key, dir, window = DEFAULT_WINDOW) {
   });
 }
 
+/** The `sort.key` of a hand-arranged table: rows follow a saved list of repos. */
+export const MANUAL = 'manual';
+
+/** Entries in the order of `order` (repo names); repos missing from it keep config order, after the rest. */
+export function manualOrder(entries, order) {
+  const rank = new Map(order.map((repo, i) => [repo, i]));
+  const key = (e, i) => rank.get(e.repo) ?? order.length + i;
+  return entries.map((e, i) => [key(e, i), e]).sort((a, b) => a[0] - b[0]).map(([, e]) => e);
+}
+
 export function isStale(entry, staleAfterSecs, now = Date.now()) {
   if (!entry.fetched_at) return true;
   return now - Date.parse(entry.fetched_at) > staleAfterSecs * 1000;
