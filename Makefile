@@ -6,18 +6,18 @@ INSTALLED  := /Applications/$(APP_NAME).app
 AGENT_ID   := ai.storyteller.craft-status
 AGENT      := $(HOME)/Library/LaunchAgents/$(AGENT_ID).plist
 
-.PHONY: dev run build bundle install uninstall test check snapshot preview icons clean
+.PHONY: dev run build bundle install uninstall test check ui snapshot preview icons clean
 
-dev:            ## tauri dev (live-reloads ui/)
-	cd $(APP_DIR) && cargo tauri dev
+dev: node_modules ## tauri dev, recompiling ui/src/ on change (live-reloads ui/)
+	npm run --silent watch & trap 'kill $$!' EXIT; cd $(APP_DIR) && cargo tauri dev
 
-run:            ## fast debug binary, no bundling
+run: node_modules ## fast debug binary, no bundling
 	cargo run -p craft-status-app
 
-build:          ## release build + every installer for this OS
+build: node_modules ## release build + every installer for this OS
 	cd $(APP_DIR) && cargo tauri build
 
-bundle:         ## release .app only (macOS)
+bundle: node_modules ## release .app only (macOS)
 	cd $(APP_DIR) && cargo tauri build --bundles app
 
 install: bundle ## copy to /Applications, start at login, launch now (macOS)
@@ -37,18 +37,19 @@ uninstall:      ## quit, remove the app and the login item (keeps config + cache
 	-pkill -x craft-status-app
 	rm -rf "$(INSTALLED)" "$(AGENT)"
 
-test:           ## Rust + UI unit tests
+test: node_modules ## Rust + UI tests
 	cargo test --workspace
-	node --test ui/*.test.mjs
+	npm test
 
-check:          ## lints
+check: node_modules ## lints
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo fmt --all -- --check
+	npm run --silent typecheck
 
 snapshot:       ## fetch once from GitHub into ui/dev-snapshot.json (prints a table)
 	cargo run -q -p craft-github --bin craft-fetch -- --snapshot ui/dev-snapshot.json
 
-preview: snapshot ## open the UI in a browser against the dev snapshot
+preview: snapshot ui ## open the UI in a browser against the dev snapshot
 	@echo "http://127.0.0.1:8766/index.html  (Ctrl+C to stop)"
 	python3 -m http.server 8766 --bind 127.0.0.1 --directory ui
 
@@ -58,3 +59,10 @@ icons:          ## regenerate icons from the SVG sources
 
 clean:
 	cargo clean
+
+node_modules: package.json package-lock.json
+	npm ci
+	@touch node_modules
+
+ui: node_modules ## compile ui/src/*.ts to ui/build/ (build.rs does this for app builds)
+	npm run --silent build

@@ -11,7 +11,7 @@ use crate::BuildLag;
 pub type Time = DateTime<Utc>;
 
 /// The "recent activity" windows, as `(id, minutes)`, shortest first. Every
-/// poll fetches all of them; the UI's dropdown picks one by id (`ui/model.js`
+/// poll fetches all of them; the UI's dropdown picks one by id (`ui/src/model.ts`
 /// lists the same ids).
 pub const WINDOWS: &[(&str, i64)] = &[
     ("10m", 10),
