@@ -171,9 +171,10 @@ The same UI also runs as a website on GitHub Pages, without the app:
   `snapshot.json`, whenever `main` changes and after each successful snapshot.
   A failed fetch leaves the site on the last good snapshot.
 
-In a browser, ⟳ re-fetches `snapshot.json`; pinning, hiding, the config and the
-global shortcut are app-only and hidden. To turn it on in a repo, set
-**Settings → Pages → Source** to **GitHub Actions**.
+In a browser, ⟳ and ⌘R reload the page, which loads the newest
+`snapshot.json`; pinning, hiding, the config and the global shortcut are
+app-only and hidden. To turn it on in a repo, set **Settings → Pages →
+Source** to **GitHub Actions**.
 
 To start the app at login, `make install` adds
 `~/Library/LaunchAgents/ai.storyteller.craft-status.plist`.

@@ -6,30 +6,25 @@ import { Window } from 'happy-dom';
 import { webApi } from './web.ts';
 import type { Snapshot } from './model.ts';
 
-const snap = (poll_secs: number): Snapshot => ({
+const snap: Snapshot = {
   repos: [], last_full_refresh_at: null, refreshing: false, next_refresh_at: null,
-  poll_secs, stale_after_secs: poll_secs, rate_limit_remaining: null, error: null,
-});
+  poll_secs: 900, stale_after_secs: 3600, rate_limit_remaining: null, error: null,
+};
 
 test('marks the page as web and serves the loaded snapshot', async () => {
   const win = new Window();
-  const api = webApi(win as unknown as globalThis.Window, async () => snap(900));
+  const api = webApi(win as unknown as globalThis.Window, async () => snap);
   assert.ok(win.document.documentElement.classList.contains('web'));
   assert.equal((await api.invoke<Snapshot>('get_snapshot')).poll_secs, 900);
   assert.equal((await api.invoke<{ shortcut: string }>('get_meta')).shortcut, '');
   await win.happyDOM.close();
 });
 
-test('refresh re-fetches and pushes the new snapshot; a failed fetch keeps the old one', async () => {
+test('refresh reloads the page, which fetches the newest snapshot', async () => {
   const win = new Window();
-  let next: Promise<Snapshot> = Promise.resolve(snap(60));
-  const api = webApi(win as unknown as globalThis.Window, () => next);
-  const seen: number[] = [];
-  api.listen<Snapshot>('craft:snapshot', (s) => seen.push(s.poll_secs));
-  await api.invoke('refresh_now');
-  next = Promise.reject(new Error('offline'));
-  next.catch(() => {});
-  await api.invoke('refresh_now');
-  assert.deepEqual(seen, [60]);
+  let reloads = 0;
+  const fake = { document: win.document, location: { reload: () => { reloads++; } } };
+  await webApi(fake as unknown as globalThis.Window, async () => snap).invoke('refresh_now');
+  assert.equal(reloads, 1);
   await win.happyDOM.close();
 });
