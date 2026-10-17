@@ -28,6 +28,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # craft-fetch's raw cache (commit authors, PRs and issues it already has), so each run
+      # fetches only what's new instead of walking every repo's history again. A cache entry can't
+      # be overwritten, so each run saves a new one and restores the newest.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/craft-status
+          key: craft-status-raw-${{ github.run_id }}
+          restore-keys: craft-status-raw-
+
       # GITHUB_TOKEN reads the public repos' data (1,000 GraphQL points an hour; a run costs
       # about 100). The config only overrides the intervals, so the footer and STALE pill match
       # this schedule (Actions often starts scheduled runs late); the repo list stays the default.
