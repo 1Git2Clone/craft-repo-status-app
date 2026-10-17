@@ -162,10 +162,16 @@ make preview    # serve ui/ in a browser against that snapshot (no Tauri needed)
 
 ## Website
 
-The same UI also runs as a website on GitHub Pages, without the app.
-`.github/workflows/pages.yml` runs every 15 minutes: it fetches a fresh
-`snapshot.json` with `craft-fetch` and deploys it next to the compiled UI. In a
-browser, ⟳ re-fetches `snapshot.json`; pinning, hiding, the config and the
+The same UI also runs as a website on GitHub Pages, without the app:
+
+- `.github/workflows/snapshot.yml` runs every 15 minutes. It fetches a fresh
+  `snapshot.json` with `craft-fetch` and force-pushes it as the only commit on
+  the `data` branch.
+- `.github/workflows/pages.yml` deploys the compiled UI from `main` with that
+  `snapshot.json`, whenever `main` changes and after each successful snapshot.
+  A failed fetch leaves the site on the last good snapshot.
+
+In a browser, ⟳ re-fetches `snapshot.json`; pinning, hiding, the config and the
 global shortcut are app-only and hidden. To turn it on in a repo, set
 **Settings → Pages → Source** to **GitHub Actions**.
 
