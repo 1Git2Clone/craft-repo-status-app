@@ -39,13 +39,14 @@ jobs:
           restore-keys: craft-status-raw-
 
       # GITHUB_TOKEN reads the public repos' data (1,000 GraphQL points an hour; a run costs
-      # about 100). The config only overrides the intervals, so the footer and STALE pill match
-      # this schedule (Actions often starts scheduled runs late); the repo list stays the default.
+      # about 100). The config only overrides the intervals; the repo list stays the default.
+      # Actions starts scheduled runs late or drops them (gaps of 2-4.5 h are common), so STALE
+      # waits 6 h and flags a broken snapshot rather than a late one.
       - name: Fetch the snapshot
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          printf 'poll_minutes = 15.0\nstale_minutes = 60.0\n' > ~/.craft_status_config.toml
+          printf 'poll_minutes = 15.0\nstale_minutes = 360.0\n' > ~/.craft_status_config.toml
           mkdir "$RUNNER_TEMP/data"
           if git fetch -q --depth=1 origin data 2>/dev/null; then
             git show FETCH_HEAD:snapshot.json > "$RUNNER_TEMP/data/snapshot.json"
