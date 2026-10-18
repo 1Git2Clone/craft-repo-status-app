@@ -41,7 +41,7 @@ jobs:
           cache: npm
 
       - name: Build the UI
-        run: npm ci && npm run build
+        run: npm ci --ignore-scripts && npm run build
 
       # Before the first snapshot run there is no `data` branch: the site deploys without data.
       - name: Assemble the site
