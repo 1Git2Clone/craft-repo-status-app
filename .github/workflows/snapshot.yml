@@ -48,8 +48,14 @@ jobs:
         run: |
           printf 'poll_minutes = 15.0\nstale_minutes = 360.0\n' > ~/.craft_status_config.toml
           mkdir "$RUNNER_TEMP/data"
-          if git fetch -q --depth=1 origin data 2>/dev/null; then
+          # The previous snapshot, so a repo that fails keeps its numbers. Only a missing `data`
+          # branch (exit 2) starts empty; any other lookup failure fails the job, as in pages.yml.
+          rc=0; git ls-remote --exit-code origin refs/heads/data >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then
+            git fetch -q --depth=1 origin data
             git show FETCH_HEAD:snapshot.json > "$RUNNER_TEMP/data/snapshot.json"
+          elif [ "$rc" != 2 ]; then
+            exit "$rc"
           fi
           cargo run -q -p craft-github --bin craft-fetch -- --snapshot "$RUNNER_TEMP/data/snapshot.json"
 

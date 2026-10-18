@@ -26,12 +26,27 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut previous: std::collections::HashMap<String, RepoEntry> = snapshot_path
-        .as_deref()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<Snapshot>(&b).ok())
-        .map(|s| s.repos.into_iter().map(|e| (e.repo.clone(), e)).collect())
-        .unwrap_or_default();
+    // No file means a first run; an unreadable one stops here rather than drop
+    // every repo's retained numbers.
+    let previous = match snapshot_path.as_deref().map(std::fs::read) {
+        None => Snapshot::default(),
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Snapshot::default(),
+        Some(read) => match read
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("previous snapshot: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    let mut previous: std::collections::HashMap<String, RepoEntry> = previous
+        .repos
+        .into_iter()
+        .map(|e| (e.repo.clone(), e))
+        .collect();
     let now = Utc::now();
     let mut snap = Snapshot {
         poll_secs: cfg.poll_secs(),
