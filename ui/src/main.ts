@@ -15,6 +15,10 @@ const api: Api = TAURI
       listen: (ev, fn) => { void TAURI.event.listen(ev, (e) => fn(e.payload as never)); },
       startResize: () => { void TAURI.window.getCurrentWindow().startResizeDragging('SouthEast'); },
     }
-  : webApi(window, async () => (await fetch('snapshot.json', { cache: 'no-store' })).json() as Promise<Snapshot>);
+  : webApi(window, async () => {
+      const res = await fetch('snapshot.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`snapshot.json: HTTP ${res.status}`);
+      return res.json() as Promise<Snapshot>;
+    });
 
 start(api);

@@ -44,14 +44,20 @@ jobs:
         run: npm ci --ignore-scripts && npm run build
 
       # Before the first snapshot run there is no `data` branch: the site deploys without data.
+      # Any other lookup failure fails the job rather than replace a working site with an empty
+      # one; `git ls-remote --exit-code` exits 2 only when the ref is missing.
       - name: Assemble the site
         run: |
           mkdir _site
           cp -R ui/index.html ui/style.css ui/build _site/
-          if git fetch -q --depth=1 origin data; then
+          rc=0; git ls-remote --exit-code origin refs/heads/data >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then
+            git fetch -q --depth=1 origin data
             git show FETCH_HEAD:snapshot.json > _site/snapshot.json
-          else
+          elif [ "$rc" = 2 ]; then
             echo "::warning::no data branch yet; run the Snapshot workflow"
+          else
+            exit "$rc"
           fi
 
       - uses: actions/configure-pages@v5
