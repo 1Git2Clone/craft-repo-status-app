@@ -1,6 +1,7 @@
 //! `craft-fetch [owner/name …] [--snapshot PATH]` — fetch stats once and print
 //! a table (debugging aid). `--snapshot` also writes a Snapshot JSON the UI
-//! can load in a plain browser (`ui/snapshot.json`).
+//! can load in a plain browser (`ui/snapshot.json`). If PATH already holds a
+//! snapshot, a repo that fails to fetch keeps its numbers from it, as in the app.
 
 use chrono::Utc;
 use craft_core::{Cache, Config, LagBasis, RepoEntry, Snapshot, ALL_TIME};
@@ -25,6 +26,12 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let mut previous: std::collections::HashMap<String, RepoEntry> = snapshot_path
+        .as_deref()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<Snapshot>(&b).ok())
+        .map(|s| s.repos.into_iter().map(|e| (e.repo.clone(), e)).collect())
+        .unwrap_or_default();
     let now = Utc::now();
     let mut snap = Snapshot {
         poll_secs: cfg.poll_secs(),
@@ -37,7 +44,9 @@ fn main() {
         "total dl", "urg", "crit"
     );
     for repo in &repos {
-        let mut entry = RepoEntry::new(repo);
+        let mut entry = previous
+            .remove(repo)
+            .unwrap_or_else(|| RepoEntry::new(repo));
         entry.last_attempt_at = Some(now);
         // Shares the app's raw cache, so either warms it for the other.
         let raw_dir = Cache::default_location()
@@ -89,9 +98,13 @@ fn main() {
                 }
                 entry.stats = Some(s);
                 entry.fetched_at = Some(now);
+                entry.error = None;
+                entry.inaccessible = false;
             }
             Err(Error::NotFound) => {
                 println!("{:<12} (not accessible)", entry.name());
+                entry = RepoEntry::new(repo);
+                entry.last_attempt_at = Some(now);
                 entry.fetched_at = Some(now);
                 entry.inaccessible = true;
             }

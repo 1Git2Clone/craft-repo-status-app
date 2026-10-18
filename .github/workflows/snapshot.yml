@@ -1,6 +1,7 @@
 # Every 15 minutes, fetch a fresh snapshot.json with craft-fetch and publish it as the only commit
 # on the `data` branch (force-pushed, so the branch never grows). pages.yml deploys it when this
-# finishes; a failed fetch leaves the site on the last good snapshot.
+# finishes; a failed fetch leaves the site on the last good snapshot, and a repo that fails within
+# a run keeps its numbers from the previous one.
 name: Snapshot
 
 on:
@@ -46,6 +47,9 @@ jobs:
         run: |
           printf 'poll_minutes = 15.0\nstale_minutes = 60.0\n' > ~/.craft_status_config.toml
           mkdir "$RUNNER_TEMP/data"
+          if git fetch -q --depth=1 origin data 2>/dev/null; then
+            git show FETCH_HEAD:snapshot.json > "$RUNNER_TEMP/data/snapshot.json"
+          fi
           cargo run -q -p craft-github --bin craft-fetch -- --snapshot "$RUNNER_TEMP/data/snapshot.json"
 
       - name: Publish it on the data branch
